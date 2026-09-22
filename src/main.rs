@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use futures_util::SinkExt as _;
 use futures_util::StreamExt as _;
+use futures_util::stream;
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use http_body_util::StreamBody;
@@ -24,6 +25,128 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::IntervalStream;
 
+/// Per-request knobs for the streaming endpoints, taken from the query string:
+/// `?ttft_ms=<u64>&interval_ms=<u64>&chunks=<u64>` (`chunk_interval_ms` is
+/// accepted as an alias for `interval_ms`).
+///
+/// The defaults reproduce the original endpoints exactly: no prefill delay,
+/// one event per second, and a stream that runs until the client disconnects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamParams {
+    /// Delay before the first event, modelling model prefill / time-to-first-token.
+    ttft_ms: u64,
+    /// Gap between events. Floored at 1ms, since a zero period panics the timer.
+    interval_ms: u64,
+    /// Number of events to emit; `None` streams indefinitely.
+    chunks: Option<u64>,
+}
+
+impl Default for StreamParams {
+    fn default() -> Self {
+        Self {
+            ttft_ms: 0,
+            interval_ms: 1000,
+            chunks: None,
+        }
+    }
+}
+
+impl StreamParams {
+    fn from_query(query: Option<&str>) -> Self {
+        let get = |keys: &[&str]| -> Option<u64> {
+            query?.split('&').find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                if keys.contains(&key) {
+                    value.parse().ok()
+                } else {
+                    None
+                }
+            })
+        };
+
+        let defaults = Self::default();
+        Self {
+            ttft_ms: get(&["ttft_ms"]).unwrap_or(defaults.ttft_ms),
+            interval_ms: get(&["interval_ms", "chunk_interval_ms"])
+                .unwrap_or(defaults.interval_ms)
+                .max(1),
+            chunks: get(&["chunks"]),
+        }
+    }
+
+    /// An interval whose first tick lands after `ttft_ms`, then repeats every
+    /// `interval_ms`. With the default `ttft_ms == 0` the first tick is
+    /// immediate, matching `tokio::time::interval`.
+    fn interval(&self) -> tokio::time::Interval {
+        tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_millis(self.ttft_ms),
+            Duration::from_millis(self.interval_ms),
+        )
+    }
+}
+
+/// Wrap a stream of SSE frames in a `text/event-stream` response.
+fn sse_response<S>(events: S) -> Response<BoxBody<Bytes, hyper::Error>>
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send + Sync + 'static,
+{
+    let mut resp = Response::new(
+        StreamBody::new(events)
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        "text/event-stream".parse().expect("valid header value"),
+    );
+    resp.headers_mut().insert(
+        hyper::header::CACHE_CONTROL,
+        "no-cache".parse().expect("valid header value"),
+    );
+    resp
+}
+
+/// One OpenAI-style `chat.completion.chunk` frame. The extra top-level `seq`
+/// field makes lost or reordered frames detectable by a benchmark client.
+fn chat_chunk_json(id: &str, model: &str, created: u64, seq: u64) -> String {
+    let chunk = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "seq": seq,
+        "choices": [{
+            "index": 0,
+            "delta": { "content": format!("tok{seq} ") },
+            "finish_reason": null,
+        }],
+    });
+    format!("data: {chunk}\n\n")
+}
+
+/// Pull `model` out of a request body so a gateway that routes on the body can
+/// be exercised; falls back to `echo` when the body is absent or unparseable.
+fn extract_model(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("model")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "echo".to_owned())
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
 /// This is our service handler. It receives a Request, routes on its
 /// path, and returns a Future of a Response.
 async fn echo(
@@ -39,7 +162,11 @@ async fn echo(
                 Full::new(Bytes::from(
                     "Try GETting data to /echo such as: `curl localhost:1234/echo`\n\
                      Try streaming SSE from /sse such as: `curl -N localhost:1234/sse`\n\
-                     Try a WebSocket at /ws such as: `websocat ws://localhost:1234/ws`",
+                     Try an OpenAI-shaped stream from /v1/chat/completions such as: \
+                     `curl -N localhost:1234/v1/chat/completions -d '{\"model\":\"gpt-4o\"}'`\n\
+                     Try a WebSocket at /ws such as: `websocat ws://localhost:1234/ws`\n\
+                     Streaming endpoints honour `?ttft_ms=<ms>&interval_ms=<ms>&chunks=<n>` \
+                     (defaults: 0ms, 1000ms, unbounded)",
                 ))
                 .map_err(|never| match never {})
                 .boxed(),
@@ -80,38 +207,56 @@ async fn echo(
             Ok(Response::new(frame_stream.boxed()))
         }
 
-        // Stream Server-Sent Events indefinitely, one per second, so a caller
-        // can exercise SSE proxying. Each event's `data` is a small JSON
-        // object carrying a sequence number, e.g. `{"seq":0}`.
+        // Stream Server-Sent Events so a caller can exercise SSE proxying.
+        // Each event's `data` is a small JSON object carrying a sequence
+        // number, e.g. `{"seq":0}`. Defaults to one event per second,
+        // indefinitely, but the cadence and count are overridable per request
+        // via [`StreamParams`].
         (&Method::GET, "/sse") => {
-            let ticks = IntervalStream::new(tokio::time::interval(Duration::from_secs(1)));
+            let params = StreamParams::from_query(req.uri().query());
             let mut seq: u64 = 0;
-            let events = ticks.map(move |_| {
+            let events = IntervalStream::new(params.interval()).map(move |_| {
                 let event = format!("id: {seq}\nevent: message\ndata: {{\"seq\":{seq}}}\n\n");
                 seq += 1;
                 Ok::<_, Infallible>(Frame::data(Bytes::from(event)))
             });
 
-            let mut resp = Response::new(
-                StreamBody::new(events)
-                    .map_err(|never| match never {})
-                    .boxed(),
-            );
-            resp.headers_mut().insert(
-                hyper::header::CONTENT_TYPE,
-                "text/event-stream".parse().expect("valid header value"),
-            );
-            resp.headers_mut().insert(
-                hyper::header::CACHE_CONTROL,
-                "no-cache".parse().expect("valid header value"),
-            );
-            Ok(resp)
+            Ok(match params.chunks {
+                Some(n) => sse_response(events.take(n as usize)),
+                None => sse_response(events),
+            })
+        }
+
+        // OpenAI-compatible chat completions. Reads `model` from the JSON body
+        // (so a gateway that routes on the body can be exercised) and streams
+        // OpenAI-shaped `chat.completion.chunk` frames, terminated by `[DONE]`
+        // when `chunks` bounds the stream. Honours the same knobs as /sse.
+        (&Method::POST, "/v1/chat/completions") => {
+            let params = StreamParams::from_query(req.uri().query());
+            let body = req.into_body().collect().await?.to_bytes();
+            let model = extract_model(&body);
+            let id = format!("chatcmpl-{}", unix_nanos());
+            let created = unix_secs();
+            let mut seq: u64 = 0;
+            let deltas = IntervalStream::new(params.interval()).map(move |_| {
+                let chunk = chat_chunk_json(&id, &model, created, seq);
+                seq += 1;
+                Ok::<_, Infallible>(Frame::data(Bytes::from(chunk)))
+            });
+
+            Ok(match params.chunks {
+                Some(n) => sse_response(deltas.take(n as usize).chain(stream::once(async {
+                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"data: [DONE]\n\n")))
+                }))),
+                None => sse_response(deltas),
+            })
         }
 
         // Upgrade to a WebSocket connection. Echoes back whatever the client
-        // sends, and separately pushes a server-initiated event (like /sse's)
-        // once a second so a caller can exercise both directions.
+        // sends, and separately pushes a server-initiated event (like /sse's),
+        // by default once a second, so a caller can exercise both directions.
         (&Method::GET, "/ws") => {
+            let params = StreamParams::from_query(req.uri().query());
             if !hyper_tungstenite::is_upgrade_request(&req) {
                 let mut resp = Response::new(
                     Full::new(Bytes::from("expected a websocket upgrade request"))
@@ -137,7 +282,7 @@ async fn echo(
             };
 
             tokio::spawn(async move {
-                if let Err(e) = serve_websocket(websocket).await {
+                if let Err(e) = serve_websocket(websocket, params).await {
                     eprintln!("websocket error: {e}");
                 }
             });
@@ -186,17 +331,21 @@ async fn echo(
 }
 
 /// Drive one accepted WebSocket connection: echo back whatever the client
-/// sends, and separately push a server-initiated event once a second, so a
-/// caller can exercise both the client-to-server and server-to-client
-/// directions.
+/// sends, and separately push a server-initiated event, by default once a
+/// second, so a caller can exercise both the client-to-server and
+/// server-to-client directions. The push cadence and count come from
+/// [`StreamParams`]; echoing always continues, even once pushes stop.
 async fn serve_websocket(
     websocket: HyperWebsocket,
+    params: StreamParams,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut websocket = websocket.await?;
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let mut ticker = params.interval();
     let mut seq: u64 = 0;
+    let mut pushed: u64 = 0;
 
     loop {
+        let pushing_done = params.chunks.is_some_and(|limit| pushed >= limit);
         tokio::select! {
             message = websocket.next() => {
                 match message {
@@ -208,7 +357,13 @@ async fn serve_websocket(
                     Some(Err(e)) => return Err(e.into()),
                 }
             }
-            _ = ticker.tick() => {
+            _ = async {
+                if pushing_done {
+                    std::future::pending::<()>().await;
+                } else {
+                    ticker.tick().await;
+                }
+            } => {
                 // A pseudo-random field, so the pushed event is visibly
                 // different each time rather than just an incrementing count.
                 let random = std::time::SystemTime::now()
@@ -217,6 +372,7 @@ async fn serve_websocket(
                     .unwrap_or(0);
                 let event = format!("{{\"seq\":{seq},\"random\":{random}}}");
                 seq += 1;
+                pushed += 1;
                 websocket.send(Message::text(event)).await?;
             }
         }
@@ -317,4 +473,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     serve(listener, acceptor).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_params_preserve_original_defaults() {
+        assert_eq!(StreamParams::from_query(None), StreamParams::default());
+        assert_eq!(StreamParams::default().interval_ms, 1000);
+        assert_eq!(StreamParams::default().chunks, None);
+        assert_eq!(StreamParams::default().ttft_ms, 0);
+    }
+
+    #[test]
+    fn stream_params_parse_query_and_interval_alias() {
+        let params = StreamParams::from_query(Some("ttft_ms=250&chunk_interval_ms=20&chunks=5"));
+        assert_eq!(params.ttft_ms, 250);
+        assert_eq!(params.interval_ms, 20);
+        assert_eq!(params.chunks, Some(5));
+
+        let params = StreamParams::from_query(Some("interval_ms=10"));
+        assert_eq!(params.interval_ms, 10);
+    }
+
+    #[test]
+    fn stream_params_floor_interval_and_ignore_junk() {
+        assert_eq!(
+            StreamParams::from_query(Some("interval_ms=0")).interval_ms,
+            1
+        );
+        assert_eq!(
+            StreamParams::from_query(Some("chunks=abc&ttft_ms=-1")).chunks,
+            None
+        );
+    }
+
+    #[test]
+    fn extract_model_reads_body_and_falls_back() {
+        assert_eq!(extract_model(br#"{"model":"gpt-4o"}"#), "gpt-4o");
+        assert_eq!(extract_model(b"not json"), "echo");
+        assert_eq!(extract_model(b"{}"), "echo");
+    }
+
+    #[test]
+    fn chat_chunk_is_an_sse_frame_carrying_model_and_seq() {
+        let frame = chat_chunk_json("chatcmpl-1", "gpt-4o", 0, 7);
+        assert!(frame.starts_with("data: "));
+        assert!(frame.ends_with("\n\n"));
+        assert!(frame.contains(r#""model":"gpt-4o""#));
+        assert!(frame.contains(r#""seq":7"#));
+        assert!(frame.contains(r#""object":"chat.completion.chunk""#));
+    }
 }
